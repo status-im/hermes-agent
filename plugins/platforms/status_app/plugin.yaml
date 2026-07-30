@@ -1,0 +1,33 @@
+name: status_app-platform
+label: Status-App
+kind: platform
+version: 1.0.0
+description: Status App gateway adapter for Hermes Agent.
+author: IFT Business Intelligence
+requires_env:
+  - name: STATUS_APP_CHAT_KEY
+    description: "Your Status App chat key"
+    prompt: "Chat Key"
+    url: "https://status.app/help/profile/understand-your-status-keys-and-recovery-phrase"
+    password: false
+  - name: STATUS_APP_DISPLAY_NAME
+    description: "The display name for your Hermes Agent"
+    prompt: "Display name"
+    url: "https://status.app/help/profile/view-and-edit-your-status-profile#name-bio-or-accent-colour"
+    password: false
+  - name: STATUS_APP_PASSWORD
+    description: "Status App password"
+    prompt: "Password"
+    url: "https://status.app/help/profile/about-changing-your-status-password"
+    password: true
+optional_env:
+  - name: STATUS_APP_MNEMONIC
+    description: "Status App Recovery Phrase"
+    prompt: "Recovery Phrase"
+    url: "https://status.app/help/profile/understand-your-status-keys-and-recovery-phrase"
+    password: false
+  - name: STATUS_APP_DOMAIN
+    description: "status-go domain"
+    prompt: "Status Backend's domain"
+    url: "https://status.app/help/profile/understand-your-status-keys-and-recovery-phrase"
+    password: false
