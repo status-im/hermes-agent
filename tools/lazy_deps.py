@@ -249,11 +249,15 @@ LAZY_DEPS: dict[str, tuple[str, ...]] = {
     # as the `teams` extra in pyproject for packagers / explicit installs.
     "platform.teams": ("microsoft-teams-apps==2.0.13.4", "aiohttp==3.14.1"),  # aiohttp 3.14.1: CVE-2026-34993(RCE)/47265 + 34513/34518/34519/34520/34525
     # Status app adapter — status-sdk drives a self-hosted status-go backend.
-    # NOTE: 1.1.3 is not on PyPI yet (latest published is 1.1.2, which lacks
-    # the ``status_sdk.models`` module the adapter imports). Until it ships,
-    # ensure("platform.status_app") fails with a pip resolution error rather
-    # than installing something unusable — mirrored in pyproject [status-app].
-    "platform.status_app": ("status-sdk==1.1.3",),
+    # Floor is 1.2.1: the adapter imports ``status_sdk.models`` (added in
+    # 1.1.3) and calls ``download_build_and_launch(launcher=...)``, whose
+    # ``launcher`` parameter only exists from 1.2.1 — on 1.2.0 that argument
+    # is still ``file_name`` and the call raises TypeError. 1.1.3 is also out
+    # on its own: its models.py had a backslash inside an f-string
+    # expression, a SyntaxError before Python 3.12 (PEP 701) and so
+    # unimportable on our 3.11 floor. Mirrored in pyproject [status-app];
+    # tests/test_project_metadata.py enforces that the two pins stay identical.
+    "platform.status_app": ("status-sdk==1.2.1",),
 
     # ─── Terminal backends ─────────────────────────────────────────────────
     "terminal.modal": ("modal==1.3.4",),

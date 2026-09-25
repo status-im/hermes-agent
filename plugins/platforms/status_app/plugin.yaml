@@ -6,28 +6,31 @@ description: Status App gateway adapter for Hermes Agent.
 author: IFT Business Intelligence
 requires_env:
   - name: STATUS_APP_CHAT_KEY
-    description: "Your Status App chat key"
+    description: "Your Status App chat key. This will allow you to communicate with the agent"
     prompt: "Chat Key"
     url: "https://status.app/help/profile/understand-your-status-keys-and-recovery-phrase"
     password: false
-  - name: STATUS_APP_DISPLAY_NAME
-    description: "The display name for your Hermes Agent"
-    prompt: "Display name"
-    url: "https://status.app/help/profile/view-and-edit-your-status-profile#name-bio-or-accent-colour"
-    password: false
   - name: STATUS_APP_PASSWORD
     description: "Status App password"
-    prompt: "Password"
+    prompt: "Agent's password that will be used in Status-Backend"
     url: "https://status.app/help/profile/about-changing-your-status-password"
     password: true
 optional_env:
+  - name: STATUS_APP_DISPLAY_NAME
+    description: "Agent's display name that will be used in Status-Backend"
+    prompt: "Display name"
+    url: "https://status.app/help/profile/view-and-edit-your-status-profile#name-bio-or-accent-colour"
+    password: false
   - name: STATUS_APP_MNEMONIC
-    description: "Status App Recovery Phrase"
+    description: "The agent's recovery phrase. Leave empty if this is your initial setup"
     prompt: "Recovery Phrase"
     url: "https://status.app/help/profile/understand-your-status-keys-and-recovery-phrase"
     password: false
   - name: STATUS_APP_DOMAIN
     description: "status-go domain"
-    prompt: "Status Backend's domain"
-    url: "https://status.app/help/profile/understand-your-status-keys-and-recovery-phrase"
+    prompt: "Domain that Status Backend will be running on"
+    password: false
+  - name: STATUS_APP_DOMAIN_PORT
+    description: "status-go domain port"
+    prompt: "Domain's port Status Backend will be running on"
     password: false

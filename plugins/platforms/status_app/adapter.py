@@ -14,20 +14,54 @@ source of truth: ``_get_env_variables()`` reads them and ``interactive_setup()``
 renders its prompts from the same declarations.
 
     STATUS_APP_CHAT_KEY       (required) chat key of the contact to talk to
-    STATUS_APP_DISPLAY_NAME   (required) this bot's Status display name
     STATUS_APP_PASSWORD       (required) Status account password
+    STATUS_APP_DISPLAY_NAME   (optional) this bot's Status display name,
+                              default "My Hermes Agent"
     STATUS_APP_MNEMONIC       (optional) recovery phrase, to restore an account
     STATUS_APP_DOMAIN         (optional) status-go host, default "localhost"
+    STATUS_APP_DOMAIN_PORT    (optional) status-go port, default "8080"
+
+Defaults for the optional vars are declared once in ``_get_env_declarations()``
+and applied by ``_get_env_variables()``, so they hold whether the value came
+from the setup wizard or was never set at all.
 
 Read by the gateway rather than by this module, and registered in
 ``register()`` rather than declared in plugin.yaml:
 
     STATUS_APP_HOME_CHANNEL     cron delivery target (cron_deliver_env_var)
-    STATUS_APP_ALLOWED_USERS    public keys allowed to command the bot
-    STATUS_APP_ALLOW_ALL_USERS  set "true" to disable the allowlist
+
+Access control needs no env var of its own: STATUS_APP_CHAT_KEY is the whole
+policy. ``_on_message`` drops every other sender, and
+``StatusAppAdapter.enforces_own_access_policy`` tells the gateway that, so its
+own ``_is_user_authorized`` default-deny does not fire.
 """
-import os, time, asyncio, threading, datetime, yaml
-from typing import Any, Dict, List, Optional
+# PEP 563 — REQUIRED here, not stylistic. Annotations below reference SDK
+# names (``models.Message``), and a parameter annotation is evaluated when
+# its ``def`` executes, i.e. while the class body runs at import time. With
+# status_sdk absent the guarded import leaves ``models`` undefined, so those
+# annotations raised NameError and killed the import of this whole module —
+# which meant check_requirements() could never run to lazy-install the SDK,
+# and the plugin loader reported "Failed to load plugin 'status_app-platform':
+# name 'models' is not defined". Making annotations lazy strings fixes it.
+from __future__ import annotations
+
+import os, time, asyncio, threading, datetime, yaml, logging, contextlib
+from typing import Any, Dict, List, Optional, Union
+
+# The adapter's own logger, matching every other platform adapter
+# (gateway/platforms/base.py, plugins/platforms/irc/adapter.py). Deliberately
+# NOT the SDK's ``Account.logger``: borrowing the client's logger would make
+# every log line in this file depend on an Account existing, which in turn
+# forces the Account to be constructed before it is needed.
+logger = logging.getLogger(__name__)
+
+# NOTE: deliberately no logging.basicConfig() here. This module is imported
+# during plugin discovery, inside whatever process Hermes happens to be —
+# CLI, TUI, gateway, cron. basicConfig() configures the ROOT logger, so a
+# call here would re-format (or silently fail to re-format, if handlers are
+# already attached) logging for every other adapter and for Hermes itself.
+# Log configuration belongs to hermes_logging.setup_logging(); a plugin only
+# ever gets a child logger.
 
 # Guarded so a missing SDK degrades to "requirements not met" instead of
 # breaking plugin discovery: an unguarded ImportError here would abort the
@@ -62,12 +96,29 @@ _STOP = object()
 # handshake with a 60s signal timeout when the backend has no live session,
 # so this has to clear that with room to spare — but still bound it, or a
 # cron job wedges indefinitely on an unreachable status-go.
-STANDALONE_SEND_TIMEOUT = 120.0
+STANDALONE_SEND_TIMEOUT = 60.0 * 5
+
+# Ceiling for the mutual-contact handshake in connect(). When neither side has
+# accepted yet, ``listen_contact_requests()`` blocks until a human taps Accept
+# in Status — which may be never. connect() is awaited by gateway startup, so
+# it has to give up eventually and let the gateway's reconnect loop retry
+# rather than leave the platform wedged in "connecting" forever.
+CONTACT_REQUEST_TIMEOUT = 300.0
 
 # models.Message.chat_type -> Hermes chat_type. Hermes keys DM-specific
 # behaviour off the literal "dm"; the SDK calls the same thing "private".
 # Communities map to "group" — closest thing Hermes models.
 _CHAT_TYPES = {"private": "dm", "group": "group", "community": "group"}
+
+# Local nickname for the peer in our own contact list. Status requires a name
+# on add_contact(); this one is never shown to the user — the peer's own
+# profile name is what their client displays.
+_CONTACT_DISPLAY_NAME = "Status User"
+
+# GitHub repo the setup wizard builds status-go from. Named here rather than
+# inline so there is one place to point at upstream (status-im/status-go) once
+# the changes this connector depends on land there.
+_STATUS_GO_REPO = "nickninov/status-go"
 
 
 def _get_env_declarations() -> List[Dict[str, Any]]:
@@ -82,8 +133,14 @@ def _get_env_declarations() -> List[Dict[str, Any]]:
     with open(file_path, 'r', encoding="utf-8") as f:
         data: dict = yaml.load(f, Loader=yaml.SafeLoader)
 
+    default = {
+        "STATUS_APP_DISPLAY_NAME": "My Hermes Agent",
+        "STATUS_APP_DOMAIN": "localhost",
+        "STATUS_APP_DOMAIN_PORT": "8080"
+    }
+
     return [
-        {**info, "required": required}
+        {**info, "required": required, "default": default.get(info["name"])}
         for current, required in [
             (data.get("requires_env") or [], True),
             (data.get("optional_env") or [], False),
@@ -102,7 +159,14 @@ def _get_env_variables() -> Dict[str, Dict[str, str | bool]]:
     """
     return {
         info["name"]: {
-            "value": os.environ.get(info["name"]),
+            # Fall back to the declared default. Without this the defaults
+            # declared above would only ever reach interactive_setup()'s
+            # prompts, and a user who skipped the wizard (env vars set by
+            # hand, docker -e, a cron process) would hand __init__ a None
+            # where it expects a string — int(None) for the port,
+            # Account(domain=None), login(name=None). Only optional vars
+            # carry defaults, so this can never mask a missing required one.
+            "value": os.environ.get(info["name"]) or info.get("default"),
             "required": info["required"],
         }
         for info in _get_env_declarations()
@@ -166,6 +230,17 @@ class StatusAppAdapter(BasePlatformAdapter):
     # Without this attribute base falls back to 4096 — and since it coerces
     # 0 to 4096 too, a falsy value here silently produces oversized sends.
     MAX_MESSAGE_LENGTH = MAX_MESSAGE_LENGTH
+
+    # This adapter gates inbound access itself: _on_message drops everything
+    # whose sender is not STATUS_APP_CHAT_KEY, so anything reaching the gateway
+    # has already passed a hard one-key allowlist. Declaring that is what stops
+    # _is_user_authorized() from default-denying it, and it replaces the
+    # STATUS_APP_ALLOWED_USERS / _ALLOW_ALL_USERS env pair outright — no key
+    # for the user to copy, nothing to keep in sync with the
+    # configured-vs-resolved encoding, nothing for a later .env reload to undo.
+    # The gateway honours this only while the policy below reads "allowlist";
+    # it refuses to trust "open", which would be a fail-open.
+    enforces_own_access_policy = True
     
     def __init__(self, config: PlatformConfig):
         super().__init__(config=config, platform=Platform(PLATFORM_NAME))
@@ -178,11 +253,35 @@ class StatusAppAdapter(BasePlatformAdapter):
         self._display_name: str = env_vars["STATUS_APP_DISPLAY_NAME"]
         self._password: str = env_vars["STATUS_APP_PASSWORD"]
         self._chat_key: str = env_vars["STATUS_APP_CHAT_KEY"]
+        # Read by _is_user_authorized() via _adapter_dm_policy/_group_policy.
+        # "allowlist" is the literal the gateway checks for before trusting
+        # enforces_own_access_policy above; the restriction it names is
+        # _on_message's single-contact filter. Group is set too because
+        # _CHAT_TYPES falls back to "group" for any chat_type the SDK reports
+        # that we don't map, and that branch reads _group_policy instead.
+        self._dm_policy = "allowlist"
+        self._group_policy = "allowlist"
+        # Optional and undeclared-by-default: unset means "create a fresh
+        # account", so this stays None rather than "" and every read below
+        # is a truthiness test, never len().
         self._mnemonic: Optional[str] = env_vars["STATUS_APP_MNEMONIC"]
-        self._domain: str = env_vars["STATUS_APP_DOMAIN"] or "localhost"
-        # Not Optional[Account]: under the guarded import Account may be None,
+        # Validated eagerly, even though the Account it feeds is not built
+        # until connect(): a non-numeric port is user error in .env, and it
+        # should fail at construction with its own name in the message rather
+        # than as an opaque connect() failure 30s into gateway startup.
+        self._domain: str = env_vars["STATUS_APP_DOMAIN"]
+        raw_port = env_vars["STATUS_APP_DOMAIN_PORT"]
+        try:
+            self._backend_port: int = int(raw_port)
+        except (TypeError, ValueError):
+            raise ValueError(f"STATUS_APP_DOMAIN_PORT must be a port number, got {raw_port!r}")
+
+        # Built in connect(), not here — see connect()'s docstring. Not
+        # Optional[Account]: under the guarded import Account may be undefined,
         # which type checkers reject in a type expression.
         self._account: Optional[Any] = None
+        # The Status Backend binary launcher path
+        self._binary_launch_path: Optional[str] = None
 
         # Listener state. The SDK's listen_messages() is a blocking
         # generator, so it runs on its own thread and hands events to the
@@ -192,67 +291,159 @@ class StatusAppAdapter(BasePlatformAdapter):
         self._pump_thread: Optional[threading.Thread] = None
         self._consumer_task: Optional[asyncio.Task] = None
         self._seen: Dict[str, float] = {}
-        
+
     # -- Connection lifecycle -----------------------------------------------
 
     async def connect(self, *, is_reconnect: bool = False) -> bool:
         """Connect and start listening. Return True on success.
 
-        Note: the SDK's ``listen_messages()`` is a blocking generator, so
-        it cannot be awaited directly — it needs a thread plus a hand-off
-        to the event loop. Outbound SDK calls block too.
-        """
-        DISPLAY_NAME = "Status User"
-        self._account = Account(domain=self._domain)
-        logger = self._account.logger
-        params = {
-            "password": self._password,
-            "name": self._display_name,
-        }
-        try:
-            if self._mnemonic:
-                params["mnemonic"] = self._mnemonic
+        Every SDK call below blocks — ``login()`` waits on a waku handshake,
+        ``listen_contact_requests()`` is a generator that parks until a human
+        taps Accept — so none of them may run on the event loop directly.
+        Doing so would stall the whole gateway: every other platform's
+        adapter, every in-flight agent turn, every timer. They run on
+        dedicated daemon threads via ``_run_blocking`` instead.
 
-            self._account.login(**params)
-            compressed_key = self._account.info["compressed_key"]
-            logger.info(f"{self._display_name} Contact Key: {compressed_key}")
-            self._chat_key = self._account.get_public_key(self._chat_key)
+        The Account is built here rather than in ``__init__`` so that
+        constructing an adapter needs no SDK: CI installs neither the
+        ``status-app`` extra nor lazy deps, so ``Account`` is an undefined
+        name there, and every unit test would otherwise have to patch it.
+        """
+        if not self._binary_launch_path:
+            self._binary_launch_path = download_build_and_launch(self._domain, self._backend_port, self._binary_launch_path)
+
+        self._account = Account(domain=self._domain, backend_port=self._backend_port)
+
+        try:
+            await self._run_blocking(self._login, name="status-app-login")
         except Exception as e:
-            logger.error(e)
+            logger.error(f"Status login failed: {e}")
             return False
 
-        contacts = self._account.contacts
-        contact: dict = contacts.get(self._chat_key, {})
-        if not contact:
-            logger.info(f"Contact not found. Sending friend request to {self._chat_key}")
-            self._account.add_contact(self._chat_key, DISPLAY_NAME)
-            contact: dict = contacts.get(self._chat_key, {})
+        try:
+            established = await self._run_blocking(
+                self._establish_contact,
+                timeout=CONTACT_REQUEST_TIMEOUT,
+                name="status-app-contact",
+            )
+        except asyncio.TimeoutError:
+            logger.error(
+                f"Contact request to {self._chat_key} was not accepted within "
+                f"{CONTACT_REQUEST_TIMEOUT:g}s — accept it in Status, then reconnect"
+            )
+            return False
+        except Exception as e:
+            logger.error(f"Status contact handshake failed: {e}")
+            return False
 
-        accepted = contact.get("mutual", False)
-        if accepted:
-            self._mark_connected()
-            self._start_listener()
-            return True
-        
-        has_added_us = contact.get("has_added_us", False)
-        self._account.add_contact(self._chat_key, DISPLAY_NAME)
-        if has_added_us:
-            self._mark_connected()
-            self._start_listener()
-            return True
-        
-        for request in self._account.listen_contact_requests():
+        if not established:
+            return False
 
-            if request.incoming and request.public_key == self._chat_key:
-                self._account.add_contact(self._chat_key, DISPLAY_NAME)
-                break
-
-            if request.accepted and request.public_key == self._chat_key:
-                break
-
-        logger.info(f"User has accepted agent's contact request!")
         self._mark_connected()
         self._start_listener()
+        return True
+
+    async def _run_blocking(
+        self,
+        fn,
+        *,
+        timeout: Optional[float] = None,
+        name: str,
+    ) -> Any:
+        """Run a blocking SDK call on a dedicated daemon thread.
+
+        Deliberately not ``run_in_executor``: a call that may never return
+        (``listen_contact_requests()``) would permanently consume one of the
+        default executor's worker slots when we time out and walk away, and
+        those slots are shared with every other executor user in the process.
+        A daemon thread is abandoned just as cheaply but costs nothing shared,
+        and it does not hold interpreter exit open.
+        """
+        loop = asyncio.get_running_loop()
+        future: asyncio.Future = loop.create_future()
+
+        def _settle(setter, value) -> None:
+            # wait_for cancels the future on timeout; the thread may still be
+            # running and settle afterwards, so never touch a done future.
+            if not future.done():
+                setter(value)
+
+        def _runner() -> None:
+            try:
+                result = fn()
+            except BaseException as e:  # noqa: BLE001 — relayed to the awaiter
+                setter, value = future.set_exception, e
+            else:
+                setter, value = future.set_result, result
+            try:
+                loop.call_soon_threadsafe(_settle, setter, value)
+            except RuntimeError:
+                pass  # loop closed underneath us during shutdown
+
+        threading.Thread(target=_runner, name=name, daemon=True).start()
+        if timeout is None:
+            return await future
+        return await asyncio.wait_for(future, timeout)
+
+    def _login(self) -> None:
+        """Log in and resolve the configured chat key. Blocking."""
+        params = {"password": self._password, "name": self._display_name}
+        if self._mnemonic:
+            params["mnemonic"] = self._mnemonic
+
+        self._account.login(**params)
+        compressed_key = self._account.info["compressed_key"]
+        logger.info(f"{self._display_name} Contact Key: {compressed_key}")
+        # STATUS_APP_CHAT_KEY may be an ENS name or a compressed key; resolve
+        # it once here so every later comparison — the inbound sender filter in
+        # particular — is against the same uncompressed form the SDK stamps on
+        # Message.from_public_key.
+        self._chat_key = self._account.get_public_key(self._chat_key)
+
+    def _establish_contact(self) -> bool:
+        """Ensure a mutual contact with ``self._chat_key``. Blocking.
+
+        Returns True once the contact is mutual (or the peer has already added
+        us, which is enough for messages to flow). Blocks in
+        ``listen_contact_requests()`` while waiting on a human to tap Accept —
+        ``connect()`` bounds that with CONTACT_REQUEST_TIMEOUT.
+        """
+        # display_name MUST be passed by keyword. add_contact's signature is
+        # (public_key, request_id=None, display_name=None), so a positional
+        # second argument lands in request_id, which the SDK forwards to
+        # status-go as AcceptContactRequest.id — a types.HexBytes. status-go
+        # then rejects it with "cannot unmarshal hex string without 0x prefix"
+        # and the whole handshake fails.
+        contact: dict = self._account.contacts.get(self._chat_key, {})
+        if not contact:
+            logger.info(f"Contact not found. Sending friend request to {self._chat_key}")
+            self._account.add_contact(self._chat_key, display_name=_CONTACT_DISPLAY_NAME)
+            contact = self._account.contacts.get(self._chat_key, {})
+
+        if contact.get("mutual", False):
+            return True
+
+        has_added_us = contact.get("has_added_us", False)
+        self._account.add_contact(self._chat_key, display_name=_CONTACT_DISPLAY_NAME)
+        if has_added_us:
+            return True
+
+        for request in self._account.listen_contact_requests():
+            if request.public_key != self._chat_key:
+                continue
+            if request.incoming:
+                # An incoming request is ACCEPTED, not re-sent: passing
+                # request_id is what routes this to acceptContactRequest.
+                self._account.add_contact(self._chat_key, request_id=request.id)
+                break
+            if request.accepted:
+                break
+        else:
+            # Generator ended without a match — the signal socket closed.
+            logger.error("Contact request stream ended before the contact was mutual")
+            return False
+
+        logger.info("User has accepted agent's contact request!")
         return True
 
     def _start_listener(self) -> None:
@@ -267,7 +458,7 @@ class StatusAppAdapter(BasePlatformAdapter):
             daemon=True,
         )
         self._pump_thread.start()
-        self._account.logger.info("Listening for messages")
+        logger.info("Listening for messages")
 
     def _offer(self, message: models.Message) -> None:
         """Put an event on the queue, dropping it if the agent is behind.
@@ -278,7 +469,7 @@ class StatusAppAdapter(BasePlatformAdapter):
         try:
             self._queue.put_nowait(message)
         except asyncio.QueueFull:
-            self._account.logger.warning("Inbound queue full — dropping event")
+            logger.warning("Inbound queue full — dropping event")
 
     def _pump(self, loop: asyncio.AbstractEventLoop) -> None:
         """Drain the SDK's blocking generator onto the event loop.
@@ -297,7 +488,7 @@ class StatusAppAdapter(BasePlatformAdapter):
                     return  # loop closed underneath us during shutdown
         except Exception as e:
             if self._running:
-                self._account.logger.error(f"Listener thread died: {e}")
+                logger.error(f"Listener thread died: {e}")
         finally:
             try:
                 loop.call_soon_threadsafe(self._offer, _STOP)
@@ -313,7 +504,7 @@ class StatusAppAdapter(BasePlatformAdapter):
             try:
                 await self._on_message(message)
             except Exception as e:
-                self._account.logger.error(f"Error handling message: {e}")
+                logger.error(f"Error handling message: {e}")
 
     async def disconnect(self) -> None:
         """Stop listeners, close connections, cancel tasks.
@@ -340,9 +531,12 @@ class StatusAppAdapter(BasePlatformAdapter):
         if self._pump_thread and self._pump_thread.is_alive():
             self._pump_thread.join(timeout=5.0)
             if self._pump_thread.is_alive():
-                self._account.logger.warning("Listener thread did not stop within 5s")
+                logger.warning("Listener thread did not stop within 5s")
         self._pump_thread = None
         self._seen.clear()
+        # Drop the logged-out Account so a later connect() builds a fresh one
+        # rather than reusing a client whose signal socket we just closed.
+        self._account = None
 
     def _logout(self) -> None:
         """Close the signal socket, then log out. Runs in an executor.
@@ -357,7 +551,7 @@ class StatusAppAdapter(BasePlatformAdapter):
             try:
                 signal.disconnect()
             except Exception as e:
-                self._account.logger.debug(f"Signal disconnect: {e}")
+                logger.debug(f"Signal disconnect: {e}")
         self._account.logout()
         
     # -- Inbound message processing -----------------------------------------
@@ -371,8 +565,18 @@ class StatusAppAdapter(BasePlatformAdapter):
         re-delivering an id, but it is no longer load-bearing the way it was
         when whole chat objects arrived on every unrelated chat update.
         """
-        # Never react to our own outbound messages.
-        if message.from_public_key == self._own_key or message.from_public_key != self._chat_key:
+        # Two rejections, deliberately separate. The first stops a reply loop
+        # on our own outbound messages. The second enforces the single-contact
+        # design: this connector serves exactly the peer named by
+        # STATUS_APP_CHAT_KEY, so traffic from anyone else — a community
+        # channel, a second contact who added us — is not ours to answer.
+
+        if message.from_public_key == self._own_key:
+            return
+        if message.from_public_key != self._chat_key:
+            logger.debug(
+                f"Ignoring message from non-configured contact {message.from_public_key}"
+            )
             return
 
         if self._is_duplicate(message.id):
@@ -381,25 +585,32 @@ class StatusAppAdapter(BasePlatformAdapter):
         # Stickers and images arrive as a URL/path in `content`; forwarding
         # that as prompt text would just confuse the agent.
         if message.content_type != "text":
-            self._account.logger.debug(f"Ignoring {message.content_type} message {message.id}")
+            logger.debug(f"Ignoring {message.content_type} message {message.id}")
             return
 
         text = (message.content or "").strip()
         if not text:
             return
 
+        # NOT message.chat_id. On an inbound 1:1 message status-go reports
+        # chatId as OUR OWN public key (verified against a live backend: own
+        # key 0x04ae8cde…, inbound chatId 0x04ae8cde…), and no chat exists
+        # under it — status-go's only chat for this conversation is keyed by
+        # the PEER, which is exactly self._chat_key. chat_id round-trips into
+        # send(), so using message.chat_id addressed a chat that cannot exist
+        # and every reply died with "Chat not found".
         source = self.build_source(
-            chat_id=message.chat_id,
-            chat_name=f"{datetime.datetime.now().date()}-{message.chat_id}",
+            chat_id=self._chat_key,
+            chat_name=f"{datetime.datetime.now().date()}-{self._chat_key}",
             chat_type=_CHAT_TYPES.get(message.chat_type, "group"),
-            # user_id is what _is_user_authorized() checks against the
-            # allowlist. It must be the actual sender — using the chat key
-            # would make every sender indistinguishable from the owner.
+            # The actual sender, not the chat key: single-contact makes them
+            # equal today, but conflating them would hide the difference if
+            # that ever stops being true.
             user_id=message.from_public_key,
             user_name=message.from_public_key,
         )
 
-        self._account.logger.info(f"Message from {message.from_public_key}: {text[:80]}")
+        logger.info(f"Message from {message.from_public_key}: {text[:80]}")
         await self.handle_message(MessageEvent(
             text=text,
             message_type=MessageType.TEXT,
@@ -468,7 +679,7 @@ class StatusAppAdapter(BasePlatformAdapter):
         except exceptions.NotLoggedInError as e:
             return SendResult(success=False, error=str(e))
         except Exception as e:
-            self._account.logger.error(f"send failed: {e}")
+            logger.error(f"send failed: {e}")
             return SendResult(success=False, error=str(e))
 
         return SendResult(success=True, message_id=message_id)
@@ -532,7 +743,8 @@ def _env_enablement() -> dict | None:
     seed: dict = {
         "chat_key": chat_key,
         "display_name": display_name,
-        "domain": get_value("STATUS_APP_DOMAIN") or "localhost",
+        "domain": get_value("STATUS_APP_DOMAIN"),
+        "domain_port": get_value("STATUS_APP_DOMAIN_PORT"),
         # The contact we talk to IS the home channel — there's no separate
         # room/channel concept to point cron at.
         "home_channel": {"chat_id": chat_key, "name": display_name},
@@ -578,13 +790,23 @@ async def _standalone_send(
 
     extra = getattr(pconfig, "extra", None) or {}
     domain = get_value("STATUS_APP_DOMAIN") or str(extra.get("domain") or "") or "localhost"
+    # Must match __init__'s Account(): a cron/send_message_tool delivery that
+    # defaulted to the SDK's built-in port while the gateway ran status-go on
+    # a custom one would fail with a connection error that looks nothing like
+    # a port mismatch.
+    raw_port = get_value("STATUS_APP_DOMAIN_PORT") or str(extra.get("domain_port") or "") or "8080"
+    try:
+        backend_port = int(raw_port)
+    except ValueError:
+        return {"error": f"STATUS_APP_DOMAIN_PORT is not a number: {raw_port!r}"}
+
     target = str(chat_id or "").strip() or get_value("STATUS_APP_CHAT_KEY")
     if not target:
         return {"error": "No chat_id given and STATUS_APP_CHAT_KEY is unset"}
 
     def send() -> Optional[str]:
         """Log in, send, and leave the session up. Blocking — runs in an executor."""
-        account = Account(domain=domain)
+        account = Account(domain=domain, backend_port=backend_port)
         params = {
             "password": get_value("STATUS_APP_PASSWORD"),
             "name": get_value("STATUS_APP_DISPLAY_NAME"),
@@ -629,7 +851,7 @@ async def _standalone_send(
     }
 
 
-def interactive_setup() -> None:
+def interactive_setup():
     """Interactive ``hermes gateway setup`` flow, rendered from plugin.yaml.
 
     Registered as ``setup_fn``. Without it ``_configure_platform()`` falls
@@ -651,73 +873,92 @@ def interactive_setup() -> None:
         print_success,
     )
 
-    print_header("Status")
-
-    existing_key = get_env_value("STATUS_APP_CHAT_KEY")
-    if existing_key:
-        print_info(f"Status App: already configured (chat key: {existing_key})")
-        if not prompt_yes_no("Reconfigure Status?", False):
-            return
-
+    print_header("Status App setup")
+    backend_setup_values: Dict[str, str] = {}
     print_info("Hermes reaches Status App through Status Backend you run yourself.")
+    if not prompt_yes_no("Do you have Status Backend already set up?", False):
+        backend_setup_values.update({
+            "STATUS_APP_DOMAIN": prompt("Domain you will be running Status Backend on", default="localhost"),
+            "STATUS_APP_DOMAIN_PORT": prompt("Domain's port you will be running Status Backend on", default="8080"),
+        })
+        # Imported here, not at module scope: on a first-time install the
+        # SDK is not present yet (it lazy-installs via check_requirements),
+        # so a module-level `utils as sdk_utils` would be unbound in exactly
+        # the run that needs it — the setup wizard.
+        if not check_requirements():
+            print_warning("status-sdk is unavailable — cannot download Status Backend")
+            return
+        from hermes_constants import display_hermes_home
+
+        print_info(f"Downloading Status-Backend build from {_STATUS_GO_REPO} and launching on {backend_setup_values['STATUS_APP_DOMAIN']}:{backend_setup_values['STATUS_APP_DOMAIN_PORT']}")
+        print_info(f"   Install directory: {display_hermes_home()}/status-backend")
+
+        download_build_and_launch(
+            backend_setup_values['STATUS_APP_DOMAIN'], 
+            backend_setup_values['STATUS_APP_DOMAIN_PORT']
+        )
+
+        print_info("Launched Status-Backend")
 
     for info in _get_env_declarations():
-        name = info["name"]
+        name: str = info["name"]
+        if name in backend_setup_values:
+            save_env_value(name, backend_setup_values[name])
+            continue
+
         label = str(info.get("prompt") or name)
-        existing = get_env_value(name) or ""
+        existing: Optional[str] = get_env_value(name)
 
         print()
-        print_info(info['description'])
-        print_info(info['url'])
+        print_info(info["description"])
+        # STATUS_APP_DOMAIN / _DOMAIN_PORT declare no help URL — only print
+        # one when the manifest actually carries it.
+        if info.get("url"):
+            print_info(info["url"])
 
-        if info.get("password"):
-            # Never echo a secret back as a prompt default.
-            value = prompt(
-                f"{label} (blank keeps current)" if existing else label,
-                password=True,
-            )
-        else:
-            # prompt() returns the default on blank input, so this is
-            # "keep current" for free.
-            value = prompt(label, default=existing)
-
-        value = (value or "").strip()
-        if not value:
-            if existing:
-                print_info(f"   Keeping existing {name}")
-            elif info["required"]:
-                print_warning(f"{name} is required — skipping Status setup")
-                return
+        if existing and not prompt_yes_no(
+            f"Found value for {name}. Would you like to overwrite existing value?", False
+        ):
             continue
+
+        params: Dict[str, Any] = {"question": label, "password": info.get("password", False)}
+        if info.get("default"):
+            params["default"] = info["default"]
+
+        value = prompt(**params).strip()
+        if not value and info["required"]:
+            print_warning(f"{name} is required — skipping Status setup")
+            return
 
         save_env_value(name, value)
 
+    # No access-control prompt: STATUS_APP_CHAT_KEY already IS the access
+    # policy. The adapter drops every other sender at intake and tells the
+    # gateway so via enforces_own_access_policy, so there is no second list
+    # to write or keep in sync.
     print()
-    print_info("🔒 Access control: who may talk to the bot")
-    print_info("   Status App public keys are cryptographic identities, so an")
-    print_info("   allowlist here is a real restriction, not a nickname check.")
-    if prompt_yes_no("Allow ALL Status App contacts to command the bot?", False):
-        save_env_value("STATUS_APP_ALLOW_ALL_USERS", "true")
-        save_env_value("STATUS_APP_ALLOWED_USERS", "")
-        print_warning("⚠️  Open access — any contact who reaches the bot can command it.")
-    else:
-        save_env_value("STATUS_APP_ALLOW_ALL_USERS", "false")
-        allowed = prompt(
-            "Allowed public keys (comma-separated, blank to deny everyone)",
-            default=get_env_value("STATUS_APP_ALLOWED_USERS")
-            or get_env_value("STATUS_APP_CHAT_KEY")
-            or "",
-        )
-        save_env_value("STATUS_APP_ALLOWED_USERS", allowed.replace(" ", ""))
-        if allowed:
-            print_success("Allowlist configured")
-        else:
-            print_info("No keys allowed — the bot ignores every message until you add one.")
-
-    print()
-    print_success("Status configuration saved to ~/.hermes/.env")
+    print_success("Status configuration saved!")
     print_info("Restart the gateway for changes to take effect: hermes gateway restart")
 
+
+def download_build_and_launch(domain: str, port: Union[int, str], launch_path: Optional[str] = None) -> str:
+    from status_sdk import utils as sdk_utils
+    from hermes_constants import get_hermes_home
+
+    if isinstance(port, str):
+        port = int(port)
+    
+    backend_dir = get_hermes_home() / "status-backend"
+    backend_dir.mkdir(parents=True, exist_ok=True)
+    with contextlib.chdir(backend_dir):
+        params = {
+            "launcher": launch_path,
+            "repo_name": _STATUS_GO_REPO,
+            "address": f"{domain}:{port}",
+        }
+        download_path = sdk_utils.download_build_and_launch(**params)
+
+    return download_path
 
 def register(ctx) -> None:
     """Plugin entry point — called by the Hermes plugin system at startup.
@@ -732,19 +973,20 @@ def register(ctx) -> None:
         check_fn=check_requirements,
         validate_config=validate_config,
         is_connected=is_connected,
-        # Both feed the setup UI, and both are the fallback path if setup_fn
-        # is ever unavailable: required_env is what _configure_platform()
-        # prints when it has no helper, install_hint is what surfaces when
-        # check_fn() fails (i.e. status_sdk missing).
         required_env=[i["name"] for i in _get_env_declarations() if i["required"]],
         install_hint="pip install status-sdk",
         setup_fn=interactive_setup,
         env_enablement_fn=_env_enablement,
         cron_deliver_env_var="STATUS_APP_HOME_CHANNEL",
         standalone_sender_fn=_standalone_send,
-        allowed_users_env="STATUS_APP_ALLOWED_USERS",
-        allow_all_env="STATUS_APP_ALLOW_ALL_USERS",
+        # No allowed_users_env / allow_all_env: access control is
+        # STATUS_APP_CHAT_KEY, enforced in _on_message and declared to the
+        # gateway by StatusAppAdapter.enforces_own_access_policy.
         max_message_length=MAX_MESSAGE_LENGTH,
         emoji="🛡️ ",
-        platform_hint="",
+        platform_hint=(
+            "You are chatting via Status App, an end-to-end encrypted "
+            "messenger. You are talking to exactly one contact, identified by "
+            "a cryptographic public key rather than a username or phone number."
+        ),
     )
