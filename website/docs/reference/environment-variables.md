@@ -668,6 +668,20 @@ Connect Hermes to a [SimpleX Chat](https://simplex.chat/) network via a local `s
 | `SIMPLEX_HOME_CHANNEL` | Default contact/group ID for cron / notification delivery. |
 | `SIMPLEX_HOME_CHANNEL_NAME` | Human label for the home channel (defaults to the ID). |
 
+### Status App
+
+Connect Hermes to a single [Status](https://status.app/) contact via a Status Backend (status-go) node you run yourself. See [the Status App messaging guide](/user-guide/messaging/status-app).
+
+| Variable | Description |
+|----------|-------------|
+| `STATUS_APP_CHAT_KEY` | Chat key of the one contact the agent talks to (required). This is the access policy — every other sender is dropped, so there is no allowlist variable. |
+| `STATUS_APP_PASSWORD` | Password for the agent's own Status account (required). |
+| `STATUS_APP_DISPLAY_NAME` | The agent's Status display name (default: `My Hermes Agent`). |
+| `STATUS_APP_MNEMONIC` | Recovery phrase to restore an existing agent account. Leave empty to create a new one. |
+| `STATUS_APP_DOMAIN` | Status Backend host (default: `localhost`). |
+| `STATUS_APP_DOMAIN_PORT` | Status Backend port (default: `8080`). |
+| `STATUS_APP_HOME_CHANNEL` | Default contact for cron / notification delivery. |
+
 ### Photon
 
 Connect Hermes to [Photon](https://photon.codes/) / Spectrum (iMessage and other Spectrum platforms) via the Node sidecar. See [the Photon messaging guide](/user-guide/messaging/photon).

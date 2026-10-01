@@ -665,6 +665,7 @@ const sidebars: SidebarsConfig = {
             'user-guide/messaging/google_chat',
             'user-guide/messaging/line',
             'user-guide/messaging/simplex',
+            'user-guide/messaging/status-app',
             'user-guide/messaging/ntfy',
             'user-guide/messaging/irc',
             'user-guide/messaging/open-webui',
